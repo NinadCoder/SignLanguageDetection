@@ -1,208 +1,199 @@
-# app.py — Flask server that:
-# - accepts frames from the browser
-# - extracts MediaPipe hand keypoints (21*3 = 63)
-# - buffers the last 30 frames
-# - runs your LSTM model and returns probs
-
-import os, io, base64, logging, json
+# app.py (Render-friendly)
+import os
+import io
+import base64
+import logging
 from collections import deque
 
-import numpy as np
-from PIL import Image
 from flask import Flask, request, jsonify, render_template
+from PIL import Image
+import numpy as np
 
-# --- DL / CV deps
-import cv2
-import tensorflow as tf
-import mediapipe as mp
+# -------- Limit thread use (helps memory/CPU on free tier)
+os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("signlang")
 
-# ---------------------- Config ----------------------
-# Try both locations so it works with your training outputs
-MODEL_CANDIDATES = ["model/model.h5", "model.h5"]
-MODEL_JSON = "model.json"  # optional (if you only saved weights)
-LABELS_TXT = "labels.txt"  # optional; if missing we fall back to A..Z
+# -------- App init (NO heavy imports here)
+app = Flask(__name__, static_folder="static", template_folder="templates")
 
-# If you want to mirror your old ROI (x: 0..300, y: 40..400), set this True
-USE_TRAINING_ROI = False
+# Config
+MODEL_PATHS = ["model/model.h5", "model.h5"]
+LABELS_PATH = os.getenv("LABELS_PATH", "labels.txt")
+USE_TRAINING_ROI = False   # set True if you need your old 0:300,40:400 crop
 
-# ---------------------- Load model ----------------------
-def load_any_model():
-    # 1) Try full SavedModel/H5
-    for p in MODEL_CANDIDATES:
-        if os.path.exists(p):
-            try:
-                m = tf.keras.models.load_model(p)
-                log.info(f"Loaded full model from {p}")
-                return m
-            except Exception as e:
-                log.warning(f"Failed load_model({p}): {e}")
+# Globals to be loaded lazily
+_tf = None
+_mp = None
+_hands = None
+_model = None
+_CLASS_NAMES = None
+_TIMESTEPS = 30
+_FEAT_DIM = 63
+BUFFER = deque(maxlen=_TIMESTEPS)
 
-    # 2) Fallback: model.json + weights.h5
-    if os.path.exists(MODEL_JSON) and os.path.exists("model.h5"):
-        with open(MODEL_JSON, "r") as f:
-            m = tf.keras.models.model_from_json(f.read())
-        m.load_weights("model.h5")
-        log.info("Loaded model from model.json + model.h5 (weights)")
-        return m
-
-    raise RuntimeError(
-        "No model found. Put your model at model/model.h5 or model.h5 "
-        "or provide model.json + model.h5 (weights)."
-    )
-
-model = load_any_model()
-
-# infer (timesteps, feat_dim) from the model itself
-# expected: (None, 30, 63)
-in_shape = model.input_shape
-_, TIMESTEPS, FEAT_DIM = in_shape if isinstance(in_shape, (list, tuple)) else (None, 30, 63)
-TIMESTEPS = TIMESTEPS or 30
-FEAT_DIM = FEAT_DIM or 63
-log.info(f"Model expects sequences of shape: (T={TIMESTEPS}, F={FEAT_DIM})")
-
-# ---------------------- Labels ----------------------
 def load_labels():
-    if os.path.exists(LABELS_TXT):
-        with open(LABELS_TXT, "r", encoding="utf-8") as f:
-            labs = [ln.strip() for ln in f if ln.strip()]
-        return labs
-    # fallback: A..Z (your training uses actions = ['A', ... 'Z'])
+    if os.path.exists(LABELS_PATH):
+        with open(LABELS_PATH, "r", encoding="utf-8") as f:
+            return [ln.strip() for ln in f if ln.strip()]
+    # default A..Z
     import string
     return list(string.ascii_uppercase[:26])
 
-CLASS_NAMES = load_labels()
-NUM_CLASSES = len(CLASS_NAMES)
-log.info(f"Loaded {NUM_CLASSES} labels.")
+def lazy_imports_and_model():
+    """Import heavy libs & load model exactly once."""
+    global _tf, _mp, _hands, _model, _CLASS_NAMES, _TIMESTEPS, _FEAT_DIM
+    if _model is not None:
+        return
 
-# ---------------------- MediaPipe ----------------------
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(
-    model_complexity=0,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
+    log.info("Loading TensorFlow (CPU) & MediaPipe lazily...")
+    import tensorflow as tf
+    import cv2
+    import mediapipe as mp
+    _tf = tf
+    _mp = mp
 
-def mediapipe_detection_bgr(bgr_image):
-    """Takes a BGR image, returns (same_bgr, results)."""
-    rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+    # Load model
+    model = None
+    last_err = None
+    for p in MODEL_PATHS:
+        if os.path.exists(p):
+            try:
+                model = tf.keras.models.load_model(p)
+                log.info(f"Loaded model from {p}")
+                break
+            except Exception as e:
+                last_err = e
+    if model is None:
+        # fallback: JSON + weights
+        if os.path.exists("model.json") and os.path.exists("model.h5"):
+            with open("model.json", "r") as f:
+                model = tf.keras.models.model_from_json(f.read())
+            model.load_weights("model.h5")
+            log.info("Loaded model from model.json + model.h5")
+        else:
+            raise RuntimeError(f"Could not load model. Last error: {last_err}")
+
+    # Infer expected input shape (None, T, F)
+    in_shape = model.input_shape
+    if isinstance(in_shape, (list, tuple)) and len(in_shape) >= 3:
+        _, T, F = in_shape[:3]
+        _TIMESTEPS = int(T or 30)
+        _FEAT_DIM = int(F or 63)
+    log.info(f"Model expects (T={_TIMESTEPS}, F={_FEAT_DIM})")
+
+    # Load labels
+    _CLASS_NAMES = load_labels()
+    log.info(f"Loaded {len(_CLASS_NAMES)} labels: {_CLASS_NAMES[:5]}...")
+
+    # Init MediaPipe Hands
+    _hands = mp.solutions.hands.Hands(
+        model_complexity=0,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5
+    )
+
+    # Stash globals
+    globals().update({
+        "_model": model,
+        "_CLASS_NAMES": _CLASS_NAMES,
+        "_TIMESTEPS": _TIMESTEPS,
+        "_FEAT_DIM": _FEAT_DIM,
+        "_hands": _hands
+    })
+
+def decode_data_url_to_bgr(data_url: str):
+    header, b64 = data_url.split(",", 1)
+    raw = base64.b64decode(b64)
+    pil = Image.open(io.BytesIO(raw)).convert("RGB")
+    arr = np.array(pil)  # RGB
+    # lazy import cv2 only when needed
+    import cv2
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+def mediapipe_detection_bgr(bgr_img):
+    import cv2
+    rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
     rgb.flags.writeable = False
-    results = hands.process(rgb)
+    results = _hands.process(rgb)
     rgb.flags.writeable = True
     out_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     return out_bgr, results
 
 def extract_keypoints(results):
-    """Return 63-dim vector (x,y,z for 21 landmarks) or zeros if none."""
     if results.multi_hand_landmarks:
-        # Use first detected hand (same as your training loop)
         hand = results.multi_hand_landmarks[0]
         rh = np.array([[lm.x, lm.y, lm.z] for lm in hand.landmark], dtype=np.float32).flatten()
         return rh  # (63,)
     return np.zeros((63,), dtype=np.float32)
 
-# ---------------------- Buffer (single-user demo) ----------------------
-BUFFER = deque(maxlen=TIMESTEPS)
-
-# ---------------------- Flask ----------------------
-app = Flask(__name__, static_folder="static", template_folder="templates")
-
 @app.route("/", methods=["GET"])
 def home():
-    return render_template("index.html", class_names=CLASS_NAMES)
+    # Light render — no heavy work here
+    names = _CLASS_NAMES if _CLASS_NAMES else load_labels()
+    return render_template("index.html", class_names=names)
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({
-        "status": "ok",
-        "timesteps": TIMESTEPS,
-        "feat_dim": FEAT_DIM,
-        "labels": CLASS_NAMES
-    })
+    # Must be fast and not trigger model load
+    return jsonify({"status": "ok", "labels": len(_CLASS_NAMES or [])})
 
 @app.route("/reset", methods=["POST"])
 def reset():
     BUFFER.clear()
     return jsonify({"status": "cleared", "buffer": 0})
 
-def decode_data_url_to_bgr(data_url: str):
-    """data:image/...;base64,XXXX -> BGR numpy image"""
-    header, b64data = data_url.split(",", 1)
-    raw = base64.b64decode(b64data)
-    pil = Image.open(io.BytesIO(raw)).convert("RGB")
-    arr = np.array(pil)  # RGB
-    bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-    return bgr
-
 @app.route("/predict", methods=["POST"])
 def predict():
-    """
-    Accepts JSON:
-      {"image": "<dataURL>"}  --> one frame
-    Streams: call this repeatedly from the browser; server maintains a 30-frame buffer.
-    """
-    try:
-        data = request.get_json(silent=True) or {}
-        data_url = data.get("image")
-        if not data_url or not data_url.startswith("data:"):
-            return jsonify({"error": "Send JSON: {'image': dataURL}"}), 400
+    # Heavy stuff only kicks in on first call
+    lazy_imports_and_model()
 
-        bgr = decode_data_url_to_bgr(data_url)
+    data = request.get_json(silent=True) or {}
+    data_url = data.get("image")
+    if not data_url or not data_url.startswith("data:"):
+        return jsonify({"error": "Send JSON: {'image': dataURL}"}), 400
 
-        # Optionally mirror your old ROI (0:300, 40:400) if you stream larger frames.
-        if USE_TRAINING_ROI:
-            H, W = bgr.shape[:2]
-            y0, y1 = 40, min(400, H)
-            x0, x1 = 0, min(300, W)
-            bgr = bgr[y0:y1, x0:x1]
+    bgr = decode_data_url_to_bgr(data_url)
 
-        _, results = mediapipe_detection_bgr(bgr)
-        kp = extract_keypoints(results)
+    if USE_TRAINING_ROI:
+        H, W = bgr.shape[:2]
+        y0, y1 = 40, min(400, H)
+        x0, x1 = 0, min(300, W)
+        bgr = bgr[y0:y1, x0:x1]
 
-        # If your model expects FEAT_DIM != 63 (because of padding in training), pad here:
-        if kp.shape[0] < FEAT_DIM:
-            kp = np.pad(kp, (0, FEAT_DIM - kp.shape[0]), mode="constant")
-        elif kp.shape[0] > FEAT_DIM:
-            kp = kp[:FEAT_DIM]
+    _, results = mediapipe_detection_bgr(bgr)
+    kp = extract_keypoints(results)
 
-        BUFFER.append(kp)
+    # pad/trim to model feature dim
+    if kp.shape[0] < _FEAT_DIM:
+        kp = np.pad(kp, (0, _FEAT_DIM - kp.shape[0]), mode="constant")
+    elif kp.shape[0] > _FEAT_DIM:
+        kp = kp[:_FEAT_DIM]
 
-        if len(BUFFER) < TIMESTEPS:
-            return jsonify({
-                "status": "collecting",
-                "have": len(BUFFER),
-                "need": TIMESTEPS
-            })
+    BUFFER.append(kp)
 
-        # Build (1, T, F) batch
-        win = np.stack(BUFFER, axis=0).astype(np.float32)   # (T, F)
-        x = np.expand_dims(win, axis=0)                     # (1, T, F)
+    if len(BUFFER) < _TIMESTEPS:
+        return jsonify({"status": "collecting", "have": len(BUFFER), "need": _TIMESTEPS})
 
-        probs = model.predict(x, verbose=0)[0]
-        probs = probs.astype(float)
-        top = int(np.argmax(probs))
-        return jsonify({
-            "status": "ok",
-            "label": CLASS_NAMES[top] if top < NUM_CLASSES else str(top),
-            "confidence": float(probs[top]),
-            "probs": {CLASS_NAMES[i]: float(probs[i]) for i in range(min(NUM_CLASSES, len(probs)))},
-            "window": TIMESTEPS
-        })
+    win = np.stack(BUFFER, axis=0).astype(np.float32)  # (T,F)
+    x = np.expand_dims(win, axis=0)                    # (1,T,F)
 
-    except Exception as e:
-        log.exception("Predict failed")
-        return jsonify({"error": str(e)}), 500
+    probs = _model.predict(x, verbose=0)[0].astype(float)
+    top = int(np.argmax(probs))
+    label = _CLASS_NAMES[top] if top < len(_CLASS_NAMES) else str(top)
+    return jsonify({
+        "status": "ok",
+        "label": label,
+        "confidence": float(probs[top]),
+        "probs": { _CLASS_NAMES[i]: float(probs[i]) for i in range(min(len(_CLASS_NAMES), len(probs))) },
+        "window": _TIMESTEPS
+    })
 
-# quick sanity check: runs model on zeros
-@app.route("/predict-test", methods=["GET"])
-def predict_test():
-    x = np.zeros((1, TIMESTEPS, FEAT_DIM), dtype=np.float32)
-    p = model.predict(x, verbose=0)[0]
-    i = int(np.argmax(p))
-    return jsonify({"label": CLASS_NAMES[i] if i < NUM_CLASSES else str(i), "confidence": float(p[i])})
-
-if __name__ == "__main__":
-    # use gunicorn in prod
-    app.run(host="0.0.0.0", port=8000, debug=False)
+# Optional: quick zero-input test — does not load model
+@app.route("/ping", methods=["GET"])
+def ping():
+    return "pong"
